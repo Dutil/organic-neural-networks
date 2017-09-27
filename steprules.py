@@ -13,3 +13,8 @@ def rmsprop(scale=1, decay_rate=0.9, max_scaling=1e5):
         updates = [(prev_mss, mss)]
         return step, updates
     return compute
+
+def sgd(lr=1e-3):
+    def compute(parameter, step):
+        return lr*step, []
+    return compute
