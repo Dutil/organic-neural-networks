@@ -1,8 +1,23 @@
 import os
 import gzip
 import pickle
+import numpy as np
+from sklearn.decomposition import PCA
+             
+def whiten_input(data):
+    
+    # Using sklearn implementation, with option whiten=True
+    print "whitening input..."
+    pca = PCA(whiten=True, svd_solver='full')
+    pca.fit(data['train']['features'])
+             
+    for s in data:
+        data[s]['features'] = pca.transform(data[s]['features'])
+        
+    return data
 
-def get_data():
+def get_data(whiten=False):
+
     path = os.environ["MNIST_PKL_GZ"]
     if not os.path.exists(path):
         try:
@@ -21,6 +36,12 @@ def get_data():
     f.close()
 
     which_sets = "train valid test".split()
-    return dict((which_set, dict(features=x.astype("float32"),
+             
+             
+    data = dict((which_set, dict(features=x.astype("float32"),
                                  targets=y.astype("int32")))
                 for which_set, (x, y) in zip(which_sets, split))
+    if whiten:
+        data = whiten_input(data)
+        
+    return data
