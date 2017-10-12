@@ -14,7 +14,7 @@ import steprules
 import whitening
 import mnist
 
-def build_prong(input_dim, n_outputs, layers):
+def build_prong(input_dim, n_outputs, layers, hyperparameters):
 
     dims = (input_dim,) + layers + (n_outputs,)
 
@@ -23,7 +23,7 @@ def build_prong(input_dim, n_outputs, layers):
              c=util.shared_floatx((m,),   initialization.constant(0)),   # input mean
              U=util.shared_floatx((m, m), initialization.identity()),    # input whitening matrix
              W=util.shared_floatx((m, n), initialization.orthogonal()),  # weight matrix
-             g=util.shared_floatx((n,),   initialization.constant(1)),   # gammas (for batch normalization)
+             g=util.shared_floatx((m if hyperparameters['bn_before'] else n,),   initialization.constant(1)),   # gammas (for batch normalization)
              b=util.shared_floatx((n,),   initialization.constant(0)))   # bias
         for m, n in util.safezip(dims[:-1], dims[1:])]
     layers[-1]["f"] = activation.logsoftmax
@@ -55,9 +55,19 @@ def get_updates(layers, h, hyperparameters):
 
         # whiten input
         h = T.dot(h - c, U)
+
+
+        # Compute the batch norm before or after the linear transformation
+        if hyperparameters['batch_normalize'] and hyperparameters['bn_before']:
+
+            h -= h.mean(axis=0, keepdims=True)
+            h /= T.sqrt(h.var(axis=0, keepdims=True) + hyperparameters["variance_bias"])
+            h *= g
+
         # compute layer as usual
         h = T.dot(h, W)
-        if hyperparameters['batch_normalize']:
+
+        if hyperparameters['batch_normalize'] and not hyperparameters['bn_before']:
             h -= h.mean(axis=0, keepdims=True)
             h /= T.sqrt(h.var(axis=0, keepdims=True) + hyperparameters["variance_bias"])
             h *= g
@@ -111,7 +121,7 @@ def build_parser():
     parser.add_argument('--folder', default='./')
     parser.add_argument('--reduction', default=False)
     parser.add_argument('--share', default=False)
-    parser.add_argument('--bn', default=False, type=bool)
+    parser.add_argument('--bn', dest='bn', action='store_true', default=False)
     parser.add_argument('--fisher', dest='fisher', action='store_true')
     parser.add_argument('--no-fisher', dest='fisher', action='store_false')
     parser.add_argument('--lr', default=1e-3, type=float)
@@ -119,11 +129,13 @@ def build_parser():
     parser.add_argument('--sample_size', default=10, type=int)
     parser.add_argument('--interval', default=100, type=int)
     parser.add_argument('--fisher-dimension', dest='fisher_dimension', default=1000, type=int)
+    parser.add_argument('--whiten-inputs', dest='whiten', action='store_true', default=False)
+    parser.add_argument('--bn-before', dest='bn_before', action='store_true', default=False)
+    parser.add_argument('--shuffle', dest='shuffle', action='store_true', default=False)
 
-    parser.add_argument('--whiten-inputs', dest='whiten', action='store_true')
-    parser.add_argument('--no-whiten-inputs', dest='whiten', action='store_false')
-    parser.add_argument('--shuffle', dest='shuffle', action='store_true',
-                        default=False)
+    parser.add_argument('--eigenvalue-bias', dest='eigenvalue_bias', type=float, default=1e-3)
+    parser.add_argument('--variance-bias', dest='variance_bias', type=float, default=1e-8)
+
     return parser
 
 def parse_args(argv):
@@ -146,11 +158,11 @@ def main(argv=None):
     lr = opt.lr
     sample_size = opt.sample_size
     interval = opt.interval
-    optimizer = opt.optimizer
     whiten_inputs = opt.whiten
     fisher_dimension = opt.fisher_dimension
-    #whiten_inputs = False
     shuffle = opt.shuffle
+    eigenvalue_bias = opt.eigenvalue_bias
+    variance_bias = opt.variance_bias
 
 
     if share_parameters:
@@ -173,11 +185,12 @@ def main(argv=None):
         # compute fisher based on supervised "loss" or model "output"
         objective="output",
         # eigenvalue bias
-        eigenvalue_bias=1e-3,
-        variance_bias=1e-8,
+        eigenvalue_bias=eigenvalue_bias,
+        variance_bias=variance_bias,
         batch_normalize=batch_normalize,
-        whiten_inputs=True,
         share_parameters=share_parameters)
+
+    hyperparameters.update(vars(opt))
 
     datasets = mnist.get_data(whiten=whiten_inputs) # TODO add CIFAR10
 
@@ -238,7 +251,7 @@ def main(argv=None):
     x = x.flatten(ndim=2)
 
     # The model
-    layers, nb_param = build_prong(input_dim, n_outputs, layers)
+    layers, nb_param = build_prong(input_dim, n_outputs, layers, hyperparameters)
     parameters_by_layer = [[layer[k] for k in ("Wgb" if batch_normalize else "Wb")] for layer in layers]
 
     # Determine which parameters to save
@@ -321,13 +334,15 @@ def main(argv=None):
         print i, "done"
 
     cross_entropies.append(compute(cost, which_set="train"))
-    identifier = abs(hash(frozenset(hyperparameters.items()+vars(opt).items())))
+    identifier = abs(hash(frozenset(hyperparameters.items())))
     np.savez_compressed(os.path.join(folder, "fishers_{}.npz".format(identifier)),
                         fishers=np.asarray(np_fishers),
                         cross_entropies=np.asarray(cross_entropies))
 
     yaml.dump(hyperparameters,
               open(os.path.join(folder, "hyperparameters_{}.yaml".format(identifier)), "w"))
+
+    print "For {}, we have saved in: {}".format(hyperparameters.items(), identifier)
 
 if __name__ == '__main__':
     main()
