@@ -10,7 +10,7 @@ def build_parser():
     # Model specific options
     parser.add_argument('--explore', default='""', type=str, help="The variable that we want to explore (sample uniformily between the bound). "
                                                                 "It needs to have the form [('param', fix_value), ('param2', (lower_bound, upper_bound))]. "
-                                                                "Will overrride train_ngd.py parameters.")
+                                                                "Will overrride train_ngd.py parameters. For the float parameters, we do a search in the log space.")
     parser.add_argument('--nb-experiments', type=int, default=1, help="The number of experiment to launch")
 
     return parser
@@ -48,10 +48,11 @@ def main(argv=None):
                     raise ValueError("The minimum value is bigger than the maxium value for {}, {}".format(value, bound))
 
                 # sampling the value
-                value = min_value + np.random.random_sample() * (max_value - min_value)
-                # TODO log sample.
                 if type(min_value) == int and type(max_value) == int:
+                    value = min_value + np.random.random_sample() * (max_value - min_value)
                     value = int(np.round(value))
+                else:
+                    value = np.exp(np.log(min_value) + (np.log(max_value) - np.log(min_value)) * np.random.random_sample())
 
 
             if variable not in setting:
