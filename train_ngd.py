@@ -115,31 +115,35 @@ def build_parser():
         description="Model for Natural Gradient descent")
 
     # Model specific options
-    parser.add_argument('--layers', nargs='+', default=[500, 300, 100], type=int)
-    parser.add_argument('--epochs', default=100, type=int)
-    parser.add_argument('--batch_size', default=100, type=int)
-    parser.add_argument('--folder', default='./')
-    parser.add_argument('--reduction', default=False)
-    parser.add_argument('--share', default=False)
-    parser.add_argument('--bn', dest='bn', action='store_true', default=False)
-    parser.add_argument('--fisher', dest='fisher', action='store_true')
-    parser.add_argument('--no-fisher', dest='fisher', action='store_false')
-    parser.add_argument('--lr', default=1e-3, type=float)
-    parser.add_argument('--optimizer', default="ngd")
-    parser.add_argument('--sample_size', default=10, type=int)
-    parser.add_argument('--interval', default=100, type=int)
-    parser.add_argument('--fisher-dimension', dest='fisher_dimension', default=1000, type=int)
-    parser.add_argument('--whiten-inputs', dest='whiten', action='store_true', default=False)
-    parser.add_argument('--bn-before', dest='bn_before', action='store_true', default=False)
-    parser.add_argument('--shuffle', dest='shuffle', action='store_true', default=False)
+    parser.add_argument('--layers', nargs='+', default=[500, 300, 100], type=int, help="The layers of the mlp.")
+    parser.add_argument('--epochs', default=100, type=int, help='The number of epochs we want ot train the network.')
+    parser.add_argument('--batch_size', default=100, type=int, help="The batch size.")
+    parser.add_argument('--folder', default='./', help='The folder where to store the experiments. Will be created if not already exists.')
+    parser.add_argument('--reduction', default=False, help='If we want to reduce the input image. (please ignore)')
+    parser.add_argument('--share', default=False, help='If the parameters of the different layers are shared or not.')
+    parser.add_argument('--bn', dest='bn', action='store_true', default=False, help="If we do batch norm or not.")
+    parser.add_argument('--fisher', dest='fisher', action='store_true', help='If we want to save the fisher information matrix or not.')
+    parser.add_argument('--no-fisher', dest='fisher', action='store_false', help='If don\'t want to save the FIM.')
+    parser.add_argument('--lr', default=1e-3, type=float, help='learning rate')
+    parser.add_argument('--sample-size', default=10, type=int, help='The number of minibatch used to compute the FIM.')
+    parser.add_argument('--interval', default=100, type=int, help='After how many minibatch we want to reparametrize. If = 0, No reparametrization is done (SGD).')
+    parser.add_argument('--fisher-dimension', dest='fisher_dimension', default=1000, type=int, help='The number of dimensions to keep to compute the FIM.')
+    parser.add_argument('--whiten-inputs', dest='whiten', action='store_true', default=False, help='If we want to whiten the inputs with zca or not.')
+    parser.add_argument('--bn-before', dest='bn_before', action='store_true', default=False, help='If we want to do batch norm before the linear transformation,')
+    parser.add_argument('--shuffle', dest='shuffle', action='store_true', default=False, help='If we want different parameters for the FIM after each epochs.')
+    parser.add_argument('--estimation-size', default=1000, type=int, help='Number of examples used to do the repametrization.')
 
-    parser.add_argument('--eigenvalue-bias', dest='eigenvalue_bias', type=float, default=1e-3)
-    parser.add_argument('--variance-bias', dest='variance_bias', type=float, default=1e-8)
+    parser.add_argument('--eigenvalue-bias', dest='eigenvalue_bias', type=float, default=1e-3, help='the bias to add to the zca transformation.')
+    parser.add_argument('--variance-bias', dest='variance_bias', type=float, default=1e-8, help='The bias to the variance for batch norm.')
 
     return parser
 
 def parse_args(argv):
-    opt = build_parser().parse_args(argv)
+    if type(argv) == list:
+        opt = build_parser().parse_args(argv)
+    else:
+        opt = argv
+
     return opt
 
 def main(argv=None):
@@ -163,6 +167,7 @@ def main(argv=None):
     shuffle = opt.shuffle
     eigenvalue_bias = opt.eigenvalue_bias
     variance_bias = opt.variance_bias
+    estimation_size = opt.estimation_size
 
 
     if share_parameters:
@@ -171,6 +176,7 @@ def main(argv=None):
             sys.exit(2)
 
     if not os.path.exists(folder):
+        print "creating {}...".format(folder)
         os.mkdir(folder)
 
 
@@ -255,7 +261,6 @@ def main(argv=None):
     parameters_by_layer = [[layer[k] for k in ("Wgb" if batch_normalize else "Wb")] for layer in layers]
 
     # Determine which parameters to save
-    # TODO the number to keep
     fisher_param_index = np.sort(np.random.choice(np.arange(nb_param), size=fisher_dimension, replace=False))
 
     # The updates, checks, and output
@@ -323,7 +328,7 @@ def main(argv=None):
 
             # Do parametrization
             if interval > 0 and no_batch % interval == 0:
-                compute(updates=updates, which_set="train", subset=slice(0, 1000))
+                compute(updates=updates, which_set="train", subset=slice(0, estimation_size))
 
             b = a + batch_size
             compute(updates=step_updates, which_set="train", subset=slice(a, b))
