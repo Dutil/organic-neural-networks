@@ -53,7 +53,7 @@ def main(argv=None):
                     value = int(np.round(value))
                 else:
                     value = np.exp(np.log(min_value) + (np.log(max_value) - np.log(min_value)) * np.random.random_sample())
-
+                    value = float(value)
 
             if variable not in setting:
                 raise ValueError("The parameter {} is nor defined.".format(variable))

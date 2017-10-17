@@ -1,4 +1,5 @@
 import sys
+
 from collections import OrderedDict
 import yaml
 import itertools
@@ -12,7 +13,7 @@ import activation
 import initialization
 import steprules
 import whitening
-import mnist
+import dataset_loader
 
 def build_prong(input_dim, n_outputs, layers, hyperparameters):
 
@@ -34,6 +35,26 @@ def build_prong(input_dim, n_outputs, layers, hyperparameters):
 
     return layers, nb_param
 
+def get_correlation_penalty(a, hyperparameters):
+
+    cov = T.dot(a.T, a)/a.shape[0]
+
+    if hyperparameters['batch_normalize'] and hyperparameters['bn_before']:
+        # The activation are centured and normalized
+        cov_minus_diag = cov * (1.-T.identity_like(cov))
+        cov_cost = (cov_minus_diag * cov_minus_diag).mean()
+    else:
+        expectation = a.mean(axis=0)
+        cov -= T.outer(expectation, expectation)
+        diag = T.diag(cov)
+        diag_diff = diag - 1.
+        pure_cov = cov - T.diag(diag)
+        cov_cost = (pure_cov * pure_cov).mean()
+        cov_cost += cov.shape[0] * (diag_diff * diag_diff).mean()
+        cov_cost /= (cov.shape[0] + 1)
+
+    return hyperparameters['correlation_penalty'] * cov_cost
+
 def get_updates(layers, h, hyperparameters):
 
 
@@ -43,18 +64,22 @@ def get_updates(layers, h, hyperparameters):
     # performing the updates
     reparameterization_checks = []
 
+    # correlation penlaty etc.
+    side_cost = 0.
+
     for i, layer in enumerate(layers):
         f, c, U, W, g, b = [layer[k] for k in "fcUWgb"]
 
         # construct reparameterization graph
-        updates, checks = whitening.get_updates(
-            h, c, U, V=W, d=b,
-            decomposition="svd", zca=True, bias=hyperparameters['eigenvalue_bias'])
-        reparameterization_updates.extend(updates)
-        reparameterization_checks.extend(checks)
+        if hyperparameters['whiten_weights']:
+            updates, checks = whitening.get_updates(
+                h, c, U, V=W, d=b,
+                decomposition="svd", zca=True, bias=hyperparameters['eigenvalue_bias'])
+            reparameterization_updates.extend(updates)
+            reparameterization_checks.extend(checks)
 
-        # whiten input
-        h = T.dot(h - c, U)
+            # whiten input
+            h = T.dot(h - c, U)
 
 
         # Compute the batch norm before or after the linear transformation
@@ -62,7 +87,10 @@ def get_updates(layers, h, hyperparameters):
 
             h -= h.mean(axis=0, keepdims=True)
             h /= T.sqrt(h.var(axis=0, keepdims=True) + hyperparameters["variance_bias"])
-            h *= g
+            # If don't scale.
+
+        if hyperparameters['correlation_penalty'] > 0.:
+            side_cost += get_correlation_penalty(h, hyperparameters)
 
         # compute layer as usual
         h = T.dot(h, W)
@@ -74,7 +102,7 @@ def get_updates(layers, h, hyperparameters):
         h += b
         h = f(h)
 
-    return reparameterization_updates, reparameterization_checks, h
+    return reparameterization_updates, reparameterization_checks, h, side_cost
 
 def get_fisher(parameters_by_layer, n_outputs, logp, cross_entropy, hyperparameters, parameters_index):
 
@@ -119,27 +147,31 @@ def build_parser():
     parser.add_argument('--epochs', default=100, type=int, help='The number of epochs we want ot train the network.')
     parser.add_argument('--batch_size', default=100, type=int, help="The batch size.")
     parser.add_argument('--folder', default='./', help='The folder where to store the experiments. Will be created if not already exists.')
-    parser.add_argument('--reduction', default=False, help='If we want to reduce the input image. (please ignore)')
-    parser.add_argument('--share', default=False, help='If the parameters of the different layers are shared or not.')
     parser.add_argument('--bn', dest='bn', action='store_true', default=False, help="If we do batch norm or not.")
-    parser.add_argument('--fisher', dest='fisher', action='store_true', help='If we want to save the fisher information matrix or not.')
-    parser.add_argument('--no-fisher', dest='fisher', action='store_false', help='If don\'t want to save the FIM.')
+    parser.add_argument('--fisher', action='store_true',
+                        default=False,  help='If we want to save the fisher information matrix or not.')
     parser.add_argument('--lr', default=1e-3, type=float, help='learning rate')
     parser.add_argument('--sample-size', default=10, type=int, help='The number of minibatch used to compute the FIM.')
     parser.add_argument('--interval', default=100, type=int, help='After how many minibatch we want to reparametrize. If = 0, No reparametrization is done (SGD).')
     parser.add_argument('--fisher-dimension', dest='fisher_dimension', default=1000, type=int, help='The number of dimensions to keep to compute the FIM.')
     parser.add_argument('--whiten-inputs', dest='whiten', action='store_true', default=False, help='If we want to whiten the inputs with zca or not.')
+    parser.add_argument('--whiten-weights', action='store_true', default=False, help='If we want to whiten the weights with zca or not.')
+
     parser.add_argument('--bn-before', dest='bn_before', action='store_true', default=False, help='If we want to do batch norm before the linear transformation,')
     parser.add_argument('--shuffle', dest='shuffle', action='store_true', default=False, help='If we want different parameters for the FIM after each epochs.')
     parser.add_argument('--estimation-size', default=1000, type=int, help='Number of examples used to do the repametrization.')
 
     parser.add_argument('--eigenvalue-bias', dest='eigenvalue_bias', type=float, default=1e-3, help='the bias to add to the zca transformation.')
     parser.add_argument('--variance-bias', dest='variance_bias', type=float, default=1e-8, help='The bias to the variance for batch norm.')
+    parser.add_argument('--correlation-penalty', type=float, default=0., help='The correlation penalty')
+
+    parser.add_argument('--data-folder', default='/u/dutilfra/datasets/', help='The folder contening the dataset.')
+    parser.add_argument('--dataset-name', default='mnist', help='Which dataset to use.')
 
     return parser
 
 def parse_args(argv):
-    if type(argv) == list:
+    if type(argv) == list or argv is None:
         opt = build_parser().parse_args(argv)
     else:
         opt = argv
@@ -156,8 +188,6 @@ def main(argv=None):
     batch_size = opt.batch_size
     folder = opt.folder
     batch_normalize = opt.bn
-    share_parameters = opt.share
-    do_reduction = opt.reduction
     save_fisher = opt.fisher
     lr = opt.lr
     sample_size = opt.sample_size
@@ -169,11 +199,9 @@ def main(argv=None):
     variance_bias = opt.variance_bias
     estimation_size = opt.estimation_size
 
+    data_folder = opt.data_folder
+    dataset_name = opt.dataset_name
 
-    if share_parameters:
-        if len(set(layers)) != 1:
-            print "With the share parameters options, all the layers need to have the same size."
-            sys.exit(2)
 
     if not os.path.exists(folder):
         print "creating {}...".format(folder)
@@ -194,11 +222,11 @@ def main(argv=None):
         eigenvalue_bias=eigenvalue_bias,
         variance_bias=variance_bias,
         batch_normalize=batch_normalize,
-        share_parameters=share_parameters)
+        share_parameters=False)
 
     hyperparameters.update(vars(opt))
 
-    datasets = mnist.get_data(whiten=whiten_inputs) # TODO add CIFAR10
+    datasets = dataset_loader.get_data(data_folder=data_folder, dataset_name=dataset_name, whiten=whiten_inputs) # TODO add CIFAR10
 
     features = T.matrix("features")
     targets = T.ivector("targets")
@@ -242,29 +270,20 @@ def main(argv=None):
     # downsample input to keep number of parameters low, (7x7)
     x = features
     x = x.reshape((x.shape[0], 1, 28, 28))
+
     input_dim = 28 * 28
-
-    if do_reduction:
-        reduction = 4
-        x = T.nnet.conv.conv2d(
-            x,
-            (np.ones((1, 1, reduction, reduction),
-                     dtype=np.float32)
-             / reduction**2),
-            subsample=(reduction, reduction))
-        input_dim = (28 / reduction)**2
-
     x = x.flatten(ndim=2)
 
     # The model
     layers, nb_param = build_prong(input_dim, n_outputs, layers, hyperparameters)
-    parameters_by_layer = [[layer[k] for k in ("Wgb" if batch_normalize else "Wb")] for layer in layers]
+    parameters_by_layer = [[layer[k] for k in ("Wgb" if batch_normalize and not
+                                               hyperparameters['bn_before'] else "Wb")] for layer in layers]
 
     # Determine which parameters to save
     fisher_param_index = np.sort(np.random.choice(np.arange(nb_param), size=fisher_dimension, replace=False))
 
     # The updates, checks, and output
-    updates, checks, h = get_updates(layers, x, hyperparameters)
+    updates, checks, h, side_cost = get_updates(layers, x, hyperparameters)
 
     if hyperparameters["share_parameters"]:
         # remove repeated parameters
@@ -274,6 +293,10 @@ def main(argv=None):
     logp = h
     cross_entropy = -logp[T.arange(logp.shape[0]), targets]
     cost = cross_entropy.mean(axis=0)
+    all_cost = cost + side_cost
+
+    # prediction
+    #prediction = T.argmax(logp, axis=1)
 
     # Get fisher for all the parameters with respect to either the logp or the cross_entropy.
     fisher = get_fisher(parameters_by_layer, n_outputs, logp, cross_entropy, hyperparameters, fisher_index)
@@ -283,7 +306,7 @@ def main(argv=None):
     steprule = steprules.sgd(lr=lr)
 
     parameters = list(itertools.chain(*parameters_by_layer))
-    gradients = OrderedDict(zip(parameters, T.grad(cost, parameters)))
+    gradients = OrderedDict(zip(parameters, T.grad(all_cost, parameters)))
     steps = []
     step_updates = []
     for parameter, gradient in gradients.items():
@@ -292,10 +315,12 @@ def main(argv=None):
         step_updates.append((parameter, parameter - step))
         step_updates.extend(steprule_updates)
 
-    # We save one fisher matrix that stay the same for all the training, and another one where the indexes changes at
-    # every epoch.
+    # Our metric, fisher matrix (optionial), cross_entropies (train, valid, test), by epoch, and by updates.
     np_fishers = []
-    cross_entropies = []
+    cross_entropies_by_epoch = {'train': [], 'valid': [], 'test': []}
+    cross_entropies_by_update = {'train': [], 'valid': [], 'test': []}
+    precision_by_epoch = {'train': [], 'valid': [], 'test': []}
+
     for i in xrange(nepochs):
 
         if save_fisher:
@@ -319,9 +344,26 @@ def main(argv=None):
 
             np_fishers.append(tmp_fisher / sample_size)
 
+        # Go over the whole dataset once to get the cost.
+        for set_name in ['train', 'valid', 'test']:
+            cross_entropies_by_epoch[set_name].append(compute(cost, which_set=set_name))
 
-        cross_entropies.append(compute(cost, which_set="train"))
-        print i, "train cross entropy", cross_entropies[-1]
+        print i, "train cross entropy", cross_entropies_by_epoch['train'][-1]
+
+        if hyperparameters['correlation_penalty'] > 0.:
+            print i, "train correlation penalty", compute(side_cost, which_set=set_name)
+
+        for set_name in ['train', 'valid', 'test']:
+            preds = compute(logp, which_set=set_name).argmax(axis=1)
+            #import ipdb; ipdb.set_trace()
+            precision = [p == t for p, t in zip(preds,
+                                            datasets[set_name]['targets'])]
+            precision = np.array(precision).mean()
+            precision_by_epoch[set_name].append(precision)
+
+        print "train precision: {}, valid precision: {}".format(
+            precision_by_epoch['train'][-1], precision_by_epoch['valid'][-1])
+
         print i, "training"
 
         for no_batch, a in enumerate(range(0, len(datasets["train"]["features"]), batch_size)):
@@ -332,17 +374,27 @@ def main(argv=None):
 
             b = a + batch_size
             compute(updates=step_updates, which_set="train", subset=slice(a, b))
+
+            ## Some random subsampling of the cost
+            #for set_name in ['train', 'valid', 'test']:
+            #    random_index = np.random.choice(np.arange(len(datasets[set_name])), size=batch_size)
+            #    cross_entropies_by_update[set_name].append(compute(cost, which_set=set_name, subset=random_index))
+
             sys.stdout.write(".")
             sys.stdout.flush()
 
         print
         print i, "done"
 
-    cross_entropies.append(compute(cost, which_set="train"))
+    for set_name in ['train', 'valid', 'test']:
+        cross_entropies_by_epoch[set_name].append(compute(cost, which_set=set_name))
+
     identifier = abs(hash(frozenset(hyperparameters.items())))
     np.savez_compressed(os.path.join(folder, "fishers_{}.npz".format(identifier)),
                         fishers=np.asarray(np_fishers),
-                        cross_entropies=np.asarray(cross_entropies))
+                        cross_entropies_by_epoch=cross_entropies_by_epoch,
+                        precision_by_epoch=precision_by_epoch,
+                        )
 
     yaml.dump(hyperparameters,
               open(os.path.join(folder, "hyperparameters_{}.yaml".format(identifier)), "w"))
