@@ -2,8 +2,6 @@ import os
 import gzip
 import pickle
 import numpy as np
-from sklearn.decomposition import PCA
-
 
 def whiten_input(data):
     # Using sklearn implementation, with option whiten=True
@@ -41,9 +39,10 @@ def zca_whitening_matrix(X):
 
     return ZCAMatrix
 
-def get_mnist():
+def get_mnist(data_folder='~/datasets/'):
 
-    path = os.environ["MNIST_PKL_GZ"]
+    path = os.path.join(data_folder, 'mnist.pkl.gz')
+
     if not os.path.exists(path):
         try:
             import urllib
@@ -67,11 +66,11 @@ def get_mnist():
         
     return data
 
-def get_data(whiten=False, dataset='mnist'):
+def get_data(data_folder='~/datasets', dataset_name='mnist', whiten=False):
 
     data = None
-    if dataset == 'mnist':
-        data = get_mnist()
+    if dataset_name == 'mnist':
+        data = get_mnist(data_folder=data_folder)
     else:
         raise ValueError("The dataset {} is not supported yet.")
 
