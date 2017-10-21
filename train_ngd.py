@@ -35,11 +35,40 @@ def build_prong(input_dim, n_outputs, layers, hyperparameters):
 
     return layers, nb_param
 
+def off_diagonal_corr_penalty(a, hyperparameters):
+
+    cov = T.dot(a.T, a) / a.shape[0]
+
+    if not hyperparameters['bn_before']: # If not centered
+        expectation = a.mean(axis=0)
+        cov -= T.outer(expectation, expectation)
+
+    diag = T.diag(cov)
+    pure_cov = cov - T.diag(diag)
+
+    cov_cost = (pure_cov * pure_cov).mean() * cov.shape[0]/(cov.shape[0] + 1)
+
+    return cov_cost
+
+def diagonal_corr_penalty(a, hyperparameters):
+
+    variance = (a * a).mean(0)
+
+    if not hyperparameters['bn_before']: # If not centered
+        expectation = a.mean(axis=0)
+        variance -= expectation * expectation
+
+    variance_diff = variance - 1.
+    cost = (variance_diff * variance_diff).mean()
+
+    return cost
+
+
 def get_correlation_penalty(a, hyperparameters):
 
     cov = T.dot(a.T, a)/a.shape[0]
 
-    if hyperparameters['batch_normalize'] and hyperparameters['bn_before']:
+    if hyperparameters['bn_normalize'] and hyperparameters['bn_before'] and not hyperparameters['bn_scale']:
         # The activation are centured and normalized
         cov_minus_diag = cov * (1.-T.identity_like(cov))
         cov_cost = (cov_minus_diag * cov_minus_diag).mean()
@@ -51,7 +80,7 @@ def get_correlation_penalty(a, hyperparameters):
         pure_cov = cov - T.diag(diag)
         cov_cost = (pure_cov * pure_cov).mean()
         cov_cost += cov.shape[0] * (diag_diff * diag_diff).mean()
-        cov_cost /= (cov.shape[0] + 1)
+        cov_cost *= cov.shape[0]/(cov.shape[0] + 1)
 
     return hyperparameters['correlation_penalty'] * cov_cost
 
@@ -65,7 +94,9 @@ def get_updates(layers, h, hyperparameters):
     reparameterization_checks = []
 
     # correlation penlaty etc.
-    side_cost = 0.
+    off_diag_cost = 0.
+    diag_cost = 0.
+
 
     for i, layer in enumerate(layers):
         f, c, U, W, g, b = [layer[k] for k in "fcUWgb"]
@@ -83,14 +114,17 @@ def get_updates(layers, h, hyperparameters):
 
 
         # Compute the batch norm before or after the linear transformation
-        if hyperparameters['batch_normalize'] and hyperparameters['bn_before']:
+        if hyperparameters['bn_before']:
 
             h -= h.mean(axis=0, keepdims=True)
-            h /= T.sqrt(h.var(axis=0, keepdims=True) + hyperparameters["variance_bias"])
-            # If don't scale.
+            if hyperparameters['bn_normalize']:
+                h /= T.sqrt(h.var(axis=0, keepdims=True) + hyperparameters["variance_bias"])
 
-        if hyperparameters['correlation_penalty'] > 0.:
-            side_cost += get_correlation_penalty(h, hyperparameters)
+            if hyperparameters['bn_scale']:
+                h *= g
+
+        off_diag_cost += off_diagonal_corr_penalty(h, hyperparameters)
+        diag_cost += diagonal_corr_penalty(h, hyperparameters)
 
         # compute layer as usual
         h = T.dot(h, W)
@@ -98,11 +132,11 @@ def get_updates(layers, h, hyperparameters):
         if hyperparameters['batch_normalize'] and not hyperparameters['bn_before']:
             h -= h.mean(axis=0, keepdims=True)
             h /= T.sqrt(h.var(axis=0, keepdims=True) + hyperparameters["variance_bias"])
-            h *= g
+            h *= g# TODO have another g
         h += b
         h = f(h)
 
-    return reparameterization_updates, reparameterization_checks, h, side_cost
+    return reparameterization_updates, reparameterization_checks, h, off_diag_cost, diag_cost
 
 def get_fisher(parameters_by_layer, n_outputs, logp, cross_entropy, hyperparameters, parameters_index):
 
@@ -158,15 +192,31 @@ def build_parser():
     parser.add_argument('--whiten-weights', action='store_true', default=False, help='If we want to whiten the weights with zca or not.')
 
     parser.add_argument('--bn-before', dest='bn_before', action='store_true', default=False, help='If we want to do batch norm before the linear transformation,')
+    parser.add_argument('--bn-normalize', action='store_true',
+                        default=False, help='If we want to normalize the activation (right after the activation),')
+    parser.add_argument('--bn-scale', action='store_true',
+                    default=False, help='If we want to scale the activation after the centering and normalization for the activation.')
+
     parser.add_argument('--shuffle', dest='shuffle', action='store_true', default=False, help='If we want different parameters for the FIM after each epochs.')
     parser.add_argument('--estimation-size', default=1000, type=int, help='Number of examples used to do the repametrization.')
 
     parser.add_argument('--eigenvalue-bias', dest='eigenvalue_bias', type=float, default=1e-3, help='the bias to add to the zca transformation.')
     parser.add_argument('--variance-bias', dest='variance_bias', type=float, default=1e-8, help='The bias to the variance for batch norm.')
-    parser.add_argument('--correlation-penalty', type=float, default=0., help='The correlation penalty')
+
 
     parser.add_argument('--data-folder', default='/u/dutilfra/datasets/', help='The folder contening the dataset.')
     parser.add_argument('--dataset-name', default='mnist', help='Which dataset to use.')
+    # TODO: spliter la cost, avoir un parametre pour quand n veux utiliser la
+    # meme.
+    parser.add_argument('--off-diagonal-penalty', type=float, default=0.,
+                        help='The correlation penalty on the off diagonal elements')
+
+    parser.add_argument('--diagonal-penalty', type=float, default=0.,
+                        help='The penalty to apply on the diagonal of the correlation matrix')
+
+    parser.add_argument('--share-correlation-penalty', action='store_true', default=False,
+                        help='If we want to share the same correlation penalty for off and on diagonal.')
+
 
     return parser
 
@@ -201,6 +251,13 @@ def main(argv=None):
 
     data_folder = opt.data_folder
     dataset_name = opt.dataset_name
+    off_diagonal_penalty = opt.off_diagonal_penalty
+    diagonal_penalty = opt.diagonal_penalty
+    share_correlation_penalty = opt.share_correlation_penalty
+
+    if share_correlation_penalty:
+        diagonal_penalty = off_diagonal_penalty
+        opt.diagonal_penalty = off_diagonal_penalty
 
 
     if not os.path.exists(folder):
@@ -276,14 +333,14 @@ def main(argv=None):
 
     # The model
     layers, nb_param = build_prong(input_dim, n_outputs, layers, hyperparameters)
-    parameters_by_layer = [[layer[k] for k in ("Wgb" if batch_normalize and not
-                                               hyperparameters['bn_before'] else "Wb")] for layer in layers]
+    parameters_by_layer = [[layer[k] for k in ("Wgb" if batch_normalize and
+                                               hyperparameters['bn_scale'] else "Wb")] for layer in layers]
 
     # Determine which parameters to save
     fisher_param_index = np.sort(np.random.choice(np.arange(nb_param), size=fisher_dimension, replace=False))
 
     # The updates, checks, and output
-    updates, checks, h, side_cost = get_updates(layers, x, hyperparameters)
+    updates, checks, h, off_diag_cost, diag_cost = get_updates(layers, x, hyperparameters)
 
     if hyperparameters["share_parameters"]:
         # remove repeated parameters
@@ -293,10 +350,8 @@ def main(argv=None):
     logp = h
     cross_entropy = -logp[T.arange(logp.shape[0]), targets]
     cost = cross_entropy.mean(axis=0)
-    all_cost = cost + side_cost
-
-    # prediction
-    #prediction = T.argmax(logp, axis=1)
+    all_cost = cost
+    all_cost += off_diagonal_penalty * off_diag_cost + diagonal_penalty * diag_cost
 
     # Get fisher for all the parameters with respect to either the logp or the cross_entropy.
     fisher = get_fisher(parameters_by_layer, n_outputs, logp, cross_entropy, hyperparameters, fisher_index)
@@ -317,9 +372,15 @@ def main(argv=None):
 
     # Our metric, fisher matrix (optionial), cross_entropies (train, valid, test), by epoch, and by updates.
     np_fishers = []
-    cross_entropies_by_epoch = {'train': [], 'valid': [], 'test': []}
-    cross_entropies_by_update = {'train': [], 'valid': [], 'test': []}
-    precision_by_epoch = {'train': [], 'valid': [], 'test': []}
+    #cross_entropies_by_epoch = {'train': [], 'valid': [], 'test': []}
+    #cross_entropies_by_update = {'train': [], 'valid': [], 'test': []}
+    #precision_by_epoch = {'train': [], 'valid': [], 'test': []}
+    #side_cost_by_epoch = {'train': [], 'valid': [], 'test': []}
+
+    metrics_to_save = {'cross_entropies_by_epoch': {'train': [], 'valid': [], 'test': []},
+                       'precision_by_epoch': {'train': [], 'valid': [], 'test': []},
+                       'off_diag_cost_by_epoch': {'train': [], 'valid': [], 'test': []},
+                       'diag_cost_by_epoch': {'train': [], 'valid': [], 'test': []}}
 
     for i in xrange(nepochs):
 
@@ -346,23 +407,29 @@ def main(argv=None):
 
         # Go over the whole dataset once to get the cost.
         for set_name in ['train', 'valid', 'test']:
-            cross_entropies_by_epoch[set_name].append(compute(cost, which_set=set_name))
+            
+            #cross entropy
+            metrics_to_save['cross_entropies_by_epoch'][set_name].append(compute(cost, which_set=set_name))
 
-        print i, "train cross entropy", cross_entropies_by_epoch['train'][-1]
+            # Side cost
+            side_cost_1 = compute(off_diag_cost, which_set=set_name)
+            side_cost_2 = compute(diag_cost, which_set=set_name)
 
-        if hyperparameters['correlation_penalty'] > 0.:
-            print i, "train correlation penalty", compute(side_cost, which_set=set_name)
+            metrics_to_save['off_diag_cost_by_epoch'][set_name].append(side_cost_1)
+            metrics_to_save['diag_cost_by_epoch'][set_name].append(side_cost_2)
 
-        for set_name in ['train', 'valid', 'test']:
+            # Precision
             preds = compute(logp, which_set=set_name).argmax(axis=1)
             #import ipdb; ipdb.set_trace()
             precision = [p == t for p, t in zip(preds,
                                             datasets[set_name]['targets'])]
             precision = np.array(precision).mean()
-            precision_by_epoch[set_name].append(precision)
+            metrics_to_save['precision_by_epoch'][set_name].append(precision)
 
-        print "train precision: {}, valid precision: {}".format(
-            precision_by_epoch['train'][-1], precision_by_epoch['valid'][-1])
+        print i, "train cross entropy", metrics_to_save['cross_entropies_by_epoch']['train'][-1]
+        print i, "train precision: {}, valid precision: {}".format(
+            metrics_to_save['precision_by_epoch']['train'][-1],
+            metrics_to_save['precision_by_epoch']['valid'][-1])
 
         print i, "training"
 
@@ -387,13 +454,14 @@ def main(argv=None):
         print i, "done"
 
     for set_name in ['train', 'valid', 'test']:
-        cross_entropies_by_epoch[set_name].append(compute(cost, which_set=set_name))
+        metrics_to_save['cross_entropies_by_epoch'][set_name].append(compute(cost, which_set=set_name))
 
     identifier = abs(hash(frozenset(hyperparameters.items())))
     np.savez_compressed(os.path.join(folder, "fishers_{}.npz".format(identifier)),
                         fishers=np.asarray(np_fishers),
-                        cross_entropies_by_epoch=cross_entropies_by_epoch,
-                        precision_by_epoch=precision_by_epoch,
+                        #cross_entropies_by_epoch=cross_entropies_by_epoch,
+                        #precision_by_epoch=precision_by_epoch,
+                        **metrics_to_save
                         )
 
     yaml.dump(hyperparameters,

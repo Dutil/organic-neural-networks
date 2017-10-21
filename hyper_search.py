@@ -2,6 +2,7 @@ import train_ngd
 import argparse
 import json
 import numpy as np
+import os
 
 def build_parser():
 
@@ -32,8 +33,13 @@ def main(argv=None):
     # The subscript don't need to know these (and it fucks with the hash)
     del setting['explore']
     del setting['nb_experiments']
+    nb_prior_exp = 0
 
-    for no_exp in range(nb_experiments):
+    if os.path.exists(opt.folder):
+        nb_prior_exp = len(os.listdir(opt.folder))/2
+        print "skipping {} experiments already done in {}".format(nb_prior_exp, opt.folder)
+
+    for no_exp in range(nb_prior_exp, nb_experiments):
 
         # Going over the variables and select there value
         for variable, bound in explore:
